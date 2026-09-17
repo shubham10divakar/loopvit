@@ -14,14 +14,64 @@ Default: B = 6, K = 2, dim 384. That is 12 block applications with only 6 blocks
 |---|---|
 | `loop_vit.py` | model (`LoopViT`, `LoopViTConfig`), `print_model_summary` |
 | `data.py` | loads an ImageFolder, with class selection and train/val split |
-| `train.py` | training loop, driven by YAML plus command-line flags |
+| `train.py` | training loop, driven by YAML plus command-line flags (supports `--resume`) |
 | `predict.py` | runs a trained checkpoint on image files or folders |
+| `downloads.py` | fetches and organizes public benchmark datasets into `datasets/` |
 | `config.yaml` | every setting in one place |
 
 ## Data layout
 ```
 data/train/<class_name>/*.jpg      # required
 data/val/<class_name>/*.jpg        # optional; otherwise val_split of train is held out
+```
+
+## Benchmark datasets
+
+`downloads.py` fetches five standard fine-grained classification datasets and
+lays each one out as `datasets/<name>/{train,test}/<class>/*.jpg`, ready to
+hand straight to `--train-dir` / `--val-dir`:
+
+| `--dataset` | classes | source |
+|---|---|---|
+| `aircraft` | 100 (FGVC-Aircraft variants) | torchvision, automatic |
+| `cub200` | 200 (Caltech-UCSD Birds-200-2011) | Caltech tarball, automatic |
+| `flowers102` | 102 (Oxford Flowers-102) | torchvision, automatic |
+| `food101` | 101 (Food-101) | torchvision, automatic |
+| `cars` | 196 (Stanford Cars) | Kaggle mirror (see below) |
+
+```bash
+pip install torch torchvision torchinfo pyyaml scipy
+
+# everything (several GB total; safe to Ctrl-C and re-run, already-done ones are skipped)
+python downloads.py --dataset all
+
+# just one or two
+python downloads.py --dataset cub200 flowers102
+
+# force real file copies instead of hardlinks (e.g. --root and the raw
+# download cache end up on different drives)
+python downloads.py --dataset food101 --copy
+```
+
+Stanford Cars' original ai.stanford.edu hosting is dead, so torchvision's own
+downloader for it refuses to run. This repo falls back to the Kaggle CLI:
+
+```bash
+pip install kaggle
+# create an API token at https://www.kaggle.com/settings ("Create New Token")
+# and save the downloaded file to ~/.kaggle/kaggle.json
+python downloads.py --dataset cars
+# or point at a different mirror:
+python downloads.py --dataset cars --kaggle-dataset <owner>/<dataset-slug>
+```
+
+Then train on any of them:
+```bash
+python train.py --config config.yaml \
+    --train-dir datasets/cub200/train --val-dir datasets/cub200/test --num-classes 200
+
+python train.py --config config.yaml \
+    --train-dir datasets/food101/train --val-dir datasets/food101/test --num-classes 101
 ```
 
 ## Usage
@@ -37,6 +87,9 @@ python train.py --config config.yaml --train-dir data/train --num-classes 5
 # pick specific classes, cap the images per class, change the loop shape
 python train.py --config config.yaml --classes cat dog horse --max-per-class 500 \
                 --num-blocks 4 --num-loops 3
+
+# resume an interrupted run (restores optimizer/scheduler state too)
+python train.py --config config.yaml --resume runs/loopvit/last.pt
 
 # predict (you can also try a different loop count at inference)
 python predict.py --ckpt runs/loopvit/best.pt --images some_folder/ --num-loops 2
