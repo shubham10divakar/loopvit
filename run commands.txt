@@ -1,0 +1,14 @@
+pip install torch torchvision torchinfo pyyaml
+
+# print the model summary only
+python train.py --config config.yaml --summary-only --num-classes 10
+
+# train
+python train.py --config config.yaml --train-dir D:\D\my docs\my docs\projects\plantdoc-predictor\modified plant village dataset\PlantVillageDataset\raw\color --num-classes 5
+
+# pick specific classes, cap the images per class, change the loop shape
+python train.py --config config.yaml --classes cat dog horse --max-per-class 500 \
+                --num-blocks 4 --num-loops 3
+
+# predict (you can also try a different loop count at inference)
+python predict.py --ckpt runs/loopvit/best.pt --images some_folder/ --num-loops 2

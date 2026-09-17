@@ -1,0 +1,41 @@
+# LoopViT (Nanbeige-style) - edit here, or override any key on the command line
+# (e.g. --num-classes 5). Keys use underscores; CLI flags use dashes.
+
+# ---------------- data ----------------
+train_dir: data/train          # one sub-folder per class
+val_dir: null                  # optional; if null, val_split of train is held out
+num_classes: null              # null = every class folder; N = use N of them
+class_selection: first         # first (alphabetical) | random (seeded) when N < total
+classes: null                  # or an explicit list, e.g. [cat, dog, horse]
+max_per_class: null            # cap images per class (null = all)
+val_split: 0.1
+augment: basic                 # none | basic | trivial
+num_workers: 4
+
+# ---------------- model ----------------
+image_size: 224
+patch_size: 16
+dim: 384
+num_blocks: 6                  # B: distinct transformer blocks in the shared stack
+num_loops: 2                   # K: passes through the stack (Nanbeige uses 2)
+num_heads: 6
+mlp_ratio: 4.0
+dropout: 0.0
+attn_dropout: 0.0
+drop_path: 0.1
+pool: cls                      # cls | mean
+loop_embedding: false          # true = add a learned per-pass vector (not in Nanbeige)
+
+# ---------------- training ----------------
+epochs: 100
+batch_size: 64
+lr: 0.0005
+min_lr: 0.00001
+weight_decay: 0.05
+warmup_epochs: 5
+label_smoothing: 0.1
+grad_clip: 1.0
+amp: true
+seed: 42
+device: auto                   # auto | cuda | mps | cpu
+output_dir: runs/loopvit
