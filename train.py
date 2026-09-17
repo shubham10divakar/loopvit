@@ -83,6 +83,7 @@ def get_args():
     t.add_argument("--device", type=str, default="auto")
     t.add_argument("--output-dir", type=str, default="runs/loopvit")
     t.add_argument("--summary-only", action="store_true")
+    t.add_argument("--resume", type=str, default=None, help="checkpoint (e.g. runs/loopvit/last.pt) to resume from")
 
     # YAML -> defaults, then CLI on top
     pre, _ = p.parse_known_args()
@@ -201,12 +202,36 @@ def main():
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
 
-    log_path = os.path.join(args.output_dir, "log.csv")
-    with open(log_path, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "lr", "train_loss", "train_acc", "val_loss", "val_acc", "val_acc_per_loop", "sec"])
+    start_epoch, step, best_acc = 1, 0, -1.0
+    if args.resume:
+        print(f"resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        if ckpt.get("classes") != class_names:
+            raise SystemExit("--resume checkpoint classes do not match the current dataset/config")
+        if ckpt.get("model_cfg") != mcfg.to_dict():
+            raise SystemExit("--resume checkpoint model config does not match the current model args")
+        model.load_state_dict(ckpt["model"])
+        if ckpt.get("optimizer") is not None:
+            opt.load_state_dict(ckpt["optimizer"])
+        if ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        step = ckpt.get("step", 0)
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_acc = ckpt.get("best_acc", -1.0)
+        rng = ckpt.get("rng_state")
+        if rng:
+            random.setstate(rng["python"])
+            torch.set_rng_state(rng["torch"].cpu())
+            if torch.cuda.is_available() and rng.get("cuda") is not None:
+                torch.cuda.set_rng_state_all(rng["cuda"])
+        print(f"resumed at epoch {start_epoch}, step {step}, best_acc {best_acc:.4f}")
 
-    best_acc, step = -1.0, 0
-    for epoch in range(1, args.epochs + 1):
+    log_path = os.path.join(args.output_dir, "log.csv")
+    if not (args.resume and os.path.exists(log_path)):
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(["epoch", "lr", "train_loss", "train_acc", "val_loss", "val_acc", "val_acc_per_loop", "sec"])
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
         n, loss_sum, correct = 0, 0.0, 0
@@ -244,12 +269,17 @@ def main():
                                     f"{va.get('loss', float('nan')):.4f}", f"{va.get('acc', float('nan')):.4f}",
                                     per_loop, f"{sec:.1f}"])
 
-        ckpt = {"model": model.state_dict(), "model_cfg": mcfg.to_dict(),
-                "classes": class_names, "epoch": epoch, "val_acc": va.get("acc")}
-        torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
         score = va.get("acc", tr["acc"])
-        if score > best_acc:
-            best_acc = score
+        is_best = score > best_acc
+        best_acc = max(best_acc, score)
+        ckpt = {"model": model.state_dict(), "model_cfg": mcfg.to_dict(),
+                "classes": class_names, "epoch": epoch, "val_acc": va.get("acc"),
+                "step": step, "best_acc": best_acc,
+                "optimizer": opt.state_dict(), "scaler": scaler.state_dict(),
+                "rng_state": {"python": random.getstate(), "torch": torch.get_rng_state(),
+                              "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}}
+        torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
+        if is_best:
             torch.save(ckpt, os.path.join(args.output_dir, "best.pt"))
 
     print(f"done. best {'val' if val_loader else 'train'} acc {best_acc:.4f} -> {args.output_dir}/best.pt")
