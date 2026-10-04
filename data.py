@@ -14,6 +14,9 @@ Configurable:
   * classes          - explicit list of folder names (overrides the two above)
   * max_per_class    - cap images per class (None = all)
   * val_split        - fraction of train held out per class when no val_dir
+  * test_split       - fraction of train held out per class as a test set when
+                       no test_dir (default 0 = no test set; with 0 the
+                       train/val split is identical to earlier versions)
 """
 from __future__ import annotations
 
@@ -90,13 +93,16 @@ def _group(samples, idx_to_name, keep, max_per_class, rng):
     return by_class
 
 
-def build_dataloaders(train_dir, val_dir=None, image_size=224, batch_size=64,
-                      num_workers=4, num_classes=None, class_selection="first",
-                      classes=None, max_per_class=None, val_split=0.1,
-                      augment="basic", seed=42, pin_memory=True):
-    rng = random.Random(seed)
-    train_tf, eval_tf = build_transforms(image_size, augment)
+def split_samples(train_dir, val_dir=None, test_dir=None, num_classes=None,
+                  class_selection="first", classes=None, max_per_class=None,
+                  val_split=0.1, test_split=0.0, seed=42):
+    """Deterministic class selection + train/val/test split.
 
+    Returns (classes, train_samples, val_samples, test_samples), each sample a
+    (path, label) pair. Re-running with the same arguments gives the same split,
+    which is how evaluate.py recovers the exact validation/test images of a run.
+    """
+    rng = random.Random(seed)
     base = datasets.ImageFolder(train_dir)
     chosen = _select_classes(base.classes, num_classes, class_selection, classes, seed)
     name_to_label = {c: i for i, c in enumerate(chosen)}
@@ -107,43 +113,73 @@ def build_dataloaders(train_dir, val_dir=None, image_size=224, batch_size=64,
     if empty:
         raise ValueError(f"No images found for classes: {empty}")
 
-    train_samples, val_samples = [], []
-    if val_dir:
-        vbase = datasets.ImageFolder(val_dir)
+    def from_dir(d):
+        vbase = datasets.ImageFolder(d)
         vidx_to_name = {i: c for c, i in vbase.class_to_idx.items()}
-        val_by_class = _group(vbase.samples, vidx_to_name, set(chosen), None, rng)
-        for c in chosen:
-            train_samples += [(p, name_to_label[c]) for p in train_by_class[c]]
-            val_samples += [(p, name_to_label[c]) for p in val_by_class.get(c, [])]
-    else:
-        # stratified hold-out: at least one val image per class when possible
-        for c in chosen:
-            paths = train_by_class[c]
-            n_val = int(round(len(paths) * val_split)) if val_split > 0 else 0
-            if val_split > 0 and len(paths) > 1:
+        by_class = _group(vbase.samples, vidx_to_name, set(chosen), None, rng)
+        return [(p, name_to_label[c]) for c in chosen for p in by_class.get(c, [])]
+
+    val_samples = from_dir(val_dir) if val_dir else []
+    test_samples = from_dir(test_dir) if test_dir else []
+    train_samples = []
+    # stratified hold-out: at least one image per class per held-out split when possible
+    for c in chosen:
+        paths = train_by_class[c]
+        n_val = 0
+        if not val_dir and val_split > 0:
+            n_val = int(round(len(paths) * val_split))
+            if len(paths) > 1:
                 n_val = max(1, n_val)
-            val_samples += [(p, name_to_label[c]) for p in paths[:n_val]]
-            train_samples += [(p, name_to_label[c]) for p in paths[n_val:]]
+        n_test = 0
+        if not test_dir and test_split > 0:
+            n_test = int(round(len(paths) * test_split))
+            if len(paths) - n_val > 1:
+                n_test = max(1, n_test)
+        val_samples += [(p, name_to_label[c]) for p in paths[:n_val]]
+        test_samples += [(p, name_to_label[c]) for p in paths[n_val:n_val + n_test]]
+        train_samples += [(p, name_to_label[c]) for p in paths[n_val + n_test:]]
+    return chosen, train_samples, val_samples, test_samples
+
+
+def make_eval_loader(samples, classes, image_size, batch_size=64, num_workers=4,
+                     pin_memory=True):
+    _, eval_tf = build_transforms(image_size)
+    ds = SampleListDataset(samples, classes, eval_tf)
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                      pin_memory=pin_memory, persistent_workers=num_workers > 0)
+
+
+def build_dataloaders(train_dir, val_dir=None, image_size=224, batch_size=64,
+                      num_workers=4, num_classes=None, class_selection="first",
+                      classes=None, max_per_class=None, val_split=0.1,
+                      augment="basic", seed=42, pin_memory=True,
+                      test_dir=None, test_split=0.0):
+    """Returns (train_loader, val_loader, test_loader, classes); the val/test
+    loaders are None when that split is empty."""
+    train_tf, _ = build_transforms(image_size, augment)
+    chosen, train_samples, val_samples, test_samples = split_samples(
+        train_dir, val_dir, test_dir, num_classes, class_selection, classes,
+        max_per_class, val_split, test_split, seed)
 
     train_ds = SampleListDataset(train_samples, chosen, train_tf)
-    val_ds = SampleListDataset(val_samples, chosen, eval_tf) if val_samples else None
-
     g = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=pin_memory,
                               drop_last=len(train_ds) > batch_size, generator=g,
                               persistent_workers=num_workers > 0)
-    val_loader = (DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=pin_memory,
-                             persistent_workers=num_workers > 0)
-                  if val_ds else None)
+    val_loader = (make_eval_loader(val_samples, chosen, image_size, batch_size,
+                                   num_workers, pin_memory) if val_samples else None)
+    test_loader = (make_eval_loader(test_samples, chosen, image_size, batch_size,
+                                    num_workers, pin_memory) if test_samples else None)
 
     counts = defaultdict(int)
     for _, y in train_samples:
         counts[y] += 1
-    print(f"[data] {len(base.classes)} class folders in {train_dir}; using {len(chosen)}")
+    print(f"[data] {len(chosen)} classes from {train_dir}")
     print(f"[data] train images: {len(train_ds)} | val images: {len(val_samples)}"
-          f" ({'from ' + val_dir if val_dir else f'{val_split:.0%} split of train'})")
+          f" ({'from ' + val_dir if val_dir else f'{val_split:.0%} split of train'})"
+          f" | test images: {len(test_samples)}"
+          f"{' (from ' + test_dir + ')' if test_dir else (f' ({test_split:.0%} split of train)' if test_samples else '')}")
     preview = ", ".join(f"{c}={counts[i]}" for i, c in enumerate(chosen[:10]))
     print(f"[data] per-class train counts: {preview}{' ...' if len(chosen) > 10 else ''}")
-    return train_loader, val_loader, chosen
+    return train_loader, val_loader, test_loader, chosen

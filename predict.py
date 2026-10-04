@@ -24,7 +24,7 @@ def main():
     p.add_argument("--topk", type=int, default=3)
     args = p.parse_args()
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     cfg = LoopViTConfig(**ckpt["model_cfg"])
     model = LoopViT(cfg)
     model.load_state_dict(ckpt["model"])

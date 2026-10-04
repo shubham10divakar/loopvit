@@ -9,6 +9,8 @@ class_selection: first         # first (alphabetical) | random (seeded) when N <
 classes: null                  # or an explicit list, e.g. [cat, dog, horse]
 max_per_class: null            # cap images per class (null = all)
 val_split: 0.1
+test_dir: null                 # optional held-out test folder
+test_split: 0.0                # fraction of train held out as test when no test_dir (0 = none; use 0.1 for papers)
 augment: basic                 # none | basic | trivial
 num_workers: 4
 
@@ -39,3 +41,7 @@ amp: true
 seed: 42
 device: auto                   # auto | cuda | mps | cpu
 output_dir: runs/loopvit
+resume: null                   # path to a checkpoint, or auto (= <output_dir>/last.pt if it exists)
+monitor: val_acc               # val_acc | val_loss: picks best.pt and drives early stopping
+early_stopping_patience: 0     # stop after N epochs without improvement (0 = off)
+early_stopping_min_delta: 0.0

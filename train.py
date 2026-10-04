@@ -11,6 +11,12 @@ Train a Nanbeige-style LoopViT on an image folder.
     # just build the model and print the summary
     python train.py --config config.yaml --summary-only --num-classes 10
 
+    # resume an interrupted run from <output_dir>/last.pt
+    python train.py --config config.yaml --resume auto
+
+    # stop when val accuracy has not improved for 15 epochs
+    python train.py --config config.yaml --early-stopping-patience 15
+
 Command-line flags override the YAML, and the YAML overrides the defaults below.
 """
 from __future__ import annotations
@@ -52,6 +58,9 @@ def get_args():
     d.add_argument("--classes", nargs="*", default=None, help="explicit class folder names")
     d.add_argument("--max-per-class", type=int_or_none, default=None)
     d.add_argument("--val-split", type=float, default=0.1)
+    d.add_argument("--test-dir", type=str, default=None, help="optional held-out test folder")
+    d.add_argument("--test-split", type=float, default=0.0,
+                   help="fraction of train held out as a test set when no --test-dir (0 = none)")
     d.add_argument("--augment", choices=["none", "basic", "trivial"], default="basic")
     d.add_argument("--num-workers", type=int, default=4)
 
@@ -83,7 +92,14 @@ def get_args():
     t.add_argument("--device", type=str, default="auto")
     t.add_argument("--output-dir", type=str, default="runs/loopvit")
     t.add_argument("--summary-only", action="store_true")
-    t.add_argument("--resume", type=str, default=None, help="checkpoint (e.g. runs/loopvit/last.pt) to resume from")
+    t.add_argument("--resume", type=str, default=None,
+                   help="checkpoint to resume from, or 'auto' for <output_dir>/last.pt (fresh start if missing)")
+    t.add_argument("--monitor", choices=["val_acc", "val_loss"], default="val_acc",
+                   help="metric that picks best.pt and drives early stopping")
+    t.add_argument("--early-stopping-patience", type=int, default=0,
+                   help="stop after this many epochs without improvement (0 = off)")
+    t.add_argument("--early-stopping-min-delta", type=float, default=0.0,
+                   help="smallest change in the monitored metric that counts as improvement")
 
     # YAML -> defaults, then CLI on top
     pre, _ = p.parse_known_args()
@@ -155,6 +171,26 @@ def evaluate(model, loader, device, criterion, per_loop=False):
     return res
 
 
+def improved(score, best, mode, min_delta):
+    if best is None:
+        return True
+    return score > best + min_delta if mode == "max" else score < best - min_delta
+
+
+def resolve_resume(resume, output_dir):
+    if not resume:
+        return None
+    if resume == "auto":
+        path = os.path.join(output_dir, "last.pt")
+        if os.path.exists(path):
+            return path
+        print(f"--resume auto: no {path} yet, starting fresh")
+        return None
+    if not os.path.exists(resume):
+        raise SystemExit(f"--resume checkpoint not found: {resume}")
+    return resume
+
+
 def main():
     args = get_args()
     seed_all(args.seed)
@@ -167,11 +203,12 @@ def main():
     else:
         if not args.train_dir:
             raise SystemExit("--train-dir (or train_dir in the YAML) is required")
-        train_loader, val_loader, class_names = build_dataloaders(
+        train_loader, val_loader, _, class_names = build_dataloaders(
             args.train_dir, args.val_dir, args.image_size, args.batch_size,
             args.num_workers, args.num_classes, args.class_selection, args.classes,
             args.max_per_class, args.val_split, args.augment, args.seed,
-            pin_memory=device.type == "cuda")
+            pin_memory=device.type == "cuda", test_dir=args.test_dir,
+            test_split=args.test_split)
 
     # ---- model --------------------------------------------------------------
     mcfg = LoopViTConfig(
@@ -202,10 +239,18 @@ def main():
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
 
-    start_epoch, step, best_acc = 1, 0, -1.0
-    if args.resume:
-        print(f"resuming from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+    mode = "max" if args.monitor == "val_acc" else "min"
+    if not val_loader:
+        if args.early_stopping_patience:
+            print("[warn] no validation set: early stopping disabled")
+        args.early_stopping_patience = 0
+
+    start_epoch, step = 1, 0
+    best_score, best_epoch, bad_epochs = None, 0, 0
+    resume_path = resolve_resume(args.resume, args.output_dir)
+    if resume_path:
+        print(f"resuming from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         if ckpt.get("classes") != class_names:
             raise SystemExit("--resume checkpoint classes do not match the current dataset/config")
         if ckpt.get("model_cfg") != mcfg.to_dict():
@@ -213,25 +258,54 @@ def main():
         model.load_state_dict(ckpt["model"])
         if ckpt.get("optimizer") is not None:
             opt.load_state_dict(ckpt["optimizer"])
+        else:
+            print("[warn] checkpoint has no optimizer state (older format): AdamW moments start from zero")
         if ckpt.get("scaler") is not None:
             scaler.load_state_dict(ckpt["scaler"])
-        step = ckpt.get("step", 0)
         start_epoch = ckpt.get("epoch", 0) + 1
-        best_acc = ckpt.get("best_acc", -1.0)
+        # older checkpoints did not store the step; rebuild it so the LR schedule continues
+        step = ckpt.get("step", (start_epoch - 1) * steps_per_epoch)
+        if ckpt.get("monitor", "val_acc") == args.monitor:
+            best_score = ckpt.get("best_score", ckpt.get("best_acc", ckpt.get("val_acc")))
+            if best_score is not None and best_score < 0:
+                best_score = None
+            best_epoch = ckpt.get("best_epoch", ckpt.get("epoch", 0))
+            bad_epochs = ckpt.get("bad_epochs", 0)
+        else:
+            print(f"[warn] checkpoint was monitoring {ckpt.get('monitor')}; best score reset")
         rng = ckpt.get("rng_state")
         if rng:
             random.setstate(rng["python"])
             torch.set_rng_state(rng["torch"].cpu())
             if torch.cuda.is_available() and rng.get("cuda") is not None:
                 torch.cuda.set_rng_state_all(rng["cuda"])
-        print(f"resumed at epoch {start_epoch}, step {step}, best_acc {best_acc:.4f}")
+        print(f"resumed at epoch {start_epoch}, step {step}, best {args.monitor} {best_score} "
+              f"(epoch {best_epoch}), epochs without improvement {bad_epochs}")
 
+    header = ["epoch", "lr", "train_loss", "train_acc", "val_loss", "val_acc", "val_acc_per_loop", "sec"]
     log_path = os.path.join(args.output_dir, "log.csv")
-    if not (args.resume and os.path.exists(log_path)):
+    if resume_path and os.path.exists(log_path):
+        # drop rows the checkpoint does not cover (e.g. logged just before a crash)
+        with open(log_path, newline="") as f:
+            rows = list(csv.reader(f))
+        kept = [r for r in rows[1:] if r and r[0].isdigit() and int(r[0]) < start_epoch]
         with open(log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "lr", "train_loss", "train_acc", "val_loss", "val_acc", "val_acc_per_loop", "sec"])
+            csv.writer(f).writerows([header] + kept)
+    else:
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(header)
 
+    patience = args.early_stopping_patience
+    stopped_early = bool(patience) and bad_epochs >= patience
+    if stopped_early:
+        print(f"early stopping already triggered in this run ({bad_epochs} epochs without improvement)")
+    lr = args.lr
+    train_start = time.time()
+    epoch = start_epoch - 1
     for epoch in range(start_epoch, args.epochs + 1):
+        if stopped_early:
+            epoch -= 1
+            break
         model.train()
         t0 = time.time()
         n, loss_sum, correct = 0, 0.0, 0
@@ -259,30 +333,55 @@ def main():
         va = evaluate(model, val_loader, device, eval_criterion, per_loop=True) if val_loader else {}
         sec = time.time() - t0
         per_loop = " ".join(f"{a:.3f}" for a in va.get("acc_per_loop", []))
+
+        # without a val set fall back to train accuracy for picking best.pt
+        score = va["acc" if args.monitor == "val_acc" else "loss"] if va else tr["acc"]
+        is_best = improved(score, best_score, mode if va else "max", args.early_stopping_min_delta)
+        if is_best:
+            best_score, best_epoch, bad_epochs = score, epoch, 0
+        else:
+            bad_epochs += 1
+
         msg = (f"epoch {epoch:3d}/{args.epochs} | lr {lr:.2e} | train loss {tr['loss']:.4f} "
                f"acc {tr['acc']:.4f}")
         if va:
             msg += f" | val loss {va['loss']:.4f} acc {va['acc']:.4f} | acc after each loop [{per_loop}]"
-        print(msg + f" | {sec:.1f}s")
+        msg += f" | {sec:.1f}s"
+        if is_best:
+            msg += " | *best*"
+        elif patience:
+            msg += f" | no improvement {bad_epochs}/{patience}"
+        print(msg)
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([epoch, f"{lr:.3e}", f"{tr['loss']:.4f}", f"{tr['acc']:.4f}",
                                     f"{va.get('loss', float('nan')):.4f}", f"{va.get('acc', float('nan')):.4f}",
                                     per_loop, f"{sec:.1f}"])
 
-        score = va.get("acc", tr["acc"])
-        is_best = score > best_acc
-        best_acc = max(best_acc, score)
+        stopped_early = bool(patience) and bad_epochs >= patience
         ckpt = {"model": model.state_dict(), "model_cfg": mcfg.to_dict(),
                 "classes": class_names, "epoch": epoch, "val_acc": va.get("acc"),
-                "step": step, "best_acc": best_acc,
+                "val_loss": va.get("loss"), "step": step,
+                "monitor": args.monitor, "best_score": best_score, "best_epoch": best_epoch,
+                "bad_epochs": bad_epochs, "stopped_early": stopped_early,
                 "optimizer": opt.state_dict(), "scaler": scaler.state_dict(),
                 "rng_state": {"python": random.getstate(), "torch": torch.get_rng_state(),
                               "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}}
         torch.save(ckpt, os.path.join(args.output_dir, "last.pt"))
         if is_best:
             torch.save(ckpt, os.path.join(args.output_dir, "best.pt"))
+        if stopped_early:
+            print(f"early stopping: {args.monitor} has not improved for {patience} epochs "
+                  f"(best {best_score:.4f} at epoch {best_epoch})")
+            break
 
-    print(f"done. best {'val' if val_loader else 'train'} acc {best_acc:.4f} -> {args.output_dir}/best.pt")
+    summary = {"best_epoch": best_epoch, "monitor": args.monitor if val_loader else "train_acc",
+               "best_score": best_score, "last_epoch": epoch, "max_epochs": args.epochs,
+               "stopped_early": stopped_early,
+               "train_seconds_this_session": round(time.time() - train_start, 1)}
+    with open(os.path.join(args.output_dir, "train_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    best_txt = f"{best_score:.4f}" if best_score is not None else "n/a"
+    print(f"done. best {summary['monitor']} {best_txt} at epoch {best_epoch} -> {args.output_dir}/best.pt")
 
 
 if __name__ == "__main__":

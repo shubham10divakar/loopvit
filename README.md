@@ -14,7 +14,11 @@ Default: B = 6, K = 2, dim 384. That is 12 block applications with only 6 blocks
 |---|---|
 | `loop_vit.py` | model (`LoopViT`, `LoopViTConfig`), `print_model_summary` |
 | `data.py` | loads an ImageFolder, with class selection and train/val split |
-| `train.py` | training loop, driven by YAML plus command-line flags (supports `--resume`) |
+| `train.py` | training loop, driven by YAML plus command-line flags (resume, early stopping) |
+| `evaluate.py` | full paper report for a run: metrics with 95% CIs, tables, figures, Grad-CAM, efficiency |
+| `gradcam.py` | Grad-CAM heat maps (one per loop pass) for any images |
+| `metrics.py`, `plots.py`, `explain.py` | metric computations, figures, Grad-CAM + deletion/insertion |
+| `tests/` | pytest suite on a tiny synthetic dataset (`python -m pytest tests`) |
 | `predict.py` | runs a trained checkpoint on image files or folders |
 | `downloads.py` | fetches and organizes public benchmark datasets into `datasets/` |
 | `config.yaml` | every setting in one place |
@@ -76,7 +80,7 @@ python train.py --config config.yaml \
 
 ## Usage
 ```bash
-pip install torch torchvision torchinfo pyyaml
+pip install -r requirements.txt
 
 # print the model summary only
 python train.py --config config.yaml --summary-only --num-classes 10
@@ -88,8 +92,12 @@ python train.py --config config.yaml --train-dir data/train --num-classes 5
 python train.py --config config.yaml --classes cat dog horse --max-per-class 500 \
                 --num-blocks 4 --num-loops 3
 
-# resume an interrupted run (restores optimizer/scheduler state too)
+# resume an interrupted run (restores optimizer/scheduler/RNG/early-stopping state)
+python train.py --config config.yaml --resume auto            # = <output_dir>/last.pt
 python train.py --config config.yaml --resume runs/loopvit/last.pt
+
+# early stopping + a held-out test split for reporting
+python train.py --config config.yaml --early-stopping-patience 15 --test-split 0.1
 
 # predict (you can also try a different loop count at inference)
 python predict.py --ckpt runs/loopvit/best.pt --images some_folder/ --num-loops 2
@@ -98,6 +106,35 @@ python predict.py --ckpt runs/loopvit/best.pt --images some_folder/ --num-loops 
 Class options: `num_classes` (null means all folders), `class_selection` (first or random), `classes` (an explicit list), and `max_per_class`.
 
 Each epoch logs the **validation accuracy read out after every pass** (`acc after each loop`). This shows whether the second pass helps.
+
+## Paper reports (`evaluate.py`)
+
+```bash
+python evaluate.py --run-dir runs/loopvit                 # test split if the run has one, else val
+python evaluate.py --run-dir runs/loopvit --split test --out-dir runs/loopvit/report_test
+python gradcam.py --ckpt runs/loopvit/best.pt --images some_folder/ --out-dir cams/
+```
+
+The split is rebuilt from the run's `config.json` with the same seed, so the report uses exactly the
+run's validation/test images. Written to `<run-dir>/report_<split>/`:
+
+- **Scores** (`metrics.json`, `metrics_summary.csv`, `report.md`): accuracy, balanced accuracy,
+  top-k, precision / recall (sensitivity) / F1 (macro, weighted, micro), specificity, NPV, MCC,
+  Cohen's kappa, ROC-AUC (OvR macro/weighted, micro, OvO), PR-AUC, log loss, Brier score,
+  ECE / MCE, all with 95% bootstrap confidence intervals.
+- **Per class** (`per_class_metrics.csv`), `classification_report.txt`, `confusion_matrix.csv`, `predictions.csv`.
+- **LaTeX tables**: `table_main.tex`, `table_per_class.tex`, `table_loops.tex`.
+- **Figures** (`figures/`, PNG at 300 dpi plus PDF): confusion matrix (raw and normalized), ROC and PR
+  curves, reliability diagram, per-class bars, training curves, t-SNE of features, and the
+  **loop ablation** (scores when reading out after 1…2K passes).
+- **Efficiency** (`efficiency.json`): parameters, untied-equivalent parameters, GFLOPs, latency, throughput, peak memory.
+- **Grad-CAM** (`gradcam/`): per-class grids, misclassified images, and an overview. Each grid has one
+  column per loop pass, because the hooked shared block runs once per pass.
+- **Faithfulness** (`faithfulness.json`, figure): deletion/insertion AUC of Grad-CAM vs a random patch
+  order, with a Wilcoxon test. This checks whether the highlighted regions really drive the prediction.
+
+If you report the val split, remember it also picked `best.pt`. For a paper, train with `--test-split`
+(or `--test-dir`) and report the test split.
 
 ## Notes
 - The default is the plain Nanbeige recipe. `loop_embedding: true` adds a learned vector per pass, which is not in Nanbeige.

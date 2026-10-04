@@ -1,0 +1,9 @@
+torch
+torchvision
+pyyaml
+numpy
+scipy
+scikit-learn
+matplotlib
+torchinfo  # optional, layer table in the model summary
+pytest     # tests only
