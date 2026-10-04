@@ -18,6 +18,7 @@ Default: B = 6, K = 2, dim 384. That is 12 block applications with only 6 blocks
 | `evaluate.py` | full paper report for a run: metrics with 95% CIs, tables, figures, Grad-CAM, efficiency |
 | `gradcam.py` | Grad-CAM heat maps (one per loop pass) for any images |
 | `metrics.py`, `plots.py`, `explain.py` | metric computations, figures, Grad-CAM + deletion/insertion |
+| `notes/` | architecture, training/evaluation notes, results so far |
 | `tests/` | pytest suite on a tiny synthetic dataset (`python -m pytest tests`) |
 | `predict.py` | runs a trained checkpoint on image files or folders |
 | `downloads.py` | fetches and organizes public benchmark datasets into `datasets/` |
@@ -135,6 +136,58 @@ run's validation/test images. Written to `<run-dir>/report_<split>/`:
 
 If you report the val split, remember it also picked `best.pt`. For a paper, train with `--test-split`
 (or `--test-dir`) and report the test split.
+
+## Command reference
+
+```bash
+pip install -r requirements.txt
+
+# model summary only
+python train.py --config config.yaml --summary-only --num-classes 5
+
+# train
+python train.py --config config.yaml --train-dir ./plantvillage --num-classes 5
+
+# train for a paper: held-out test split + early stopping
+python train.py --config config.yaml --train-dir ./plantvillage --num-classes 5                 --test-split 0.1 --early-stopping-patience 15
+
+# continue an interrupted run (also works with older checkpoints)
+python train.py --config config.yaml --train-dir ./plantvillage --num-classes 5                 --resume auto --early-stopping-patience 15
+python train.py --config config.yaml --train-dir ./plantvillage --num-classes 5                 --resume runs/loopvit/last.pt
+
+# full paper report (test split if the run has one, else val)
+python evaluate.py --run-dir runs/loopvit
+python evaluate.py --run-dir runs/loopvit --split test --ckpt runs/loopvit/best.pt                    --out-dir runs/loopvit/report_test
+# faster: no bootstrap, no deletion/insertion test, no t-SNE
+python evaluate.py --run-dir runs/loopvit --bootstrap 0 --faithfulness-samples 0 --no-tsne
+
+# Grad-CAM for any images or folders (one heatmap per loop pass)
+python gradcam.py --ckpt runs/loopvit/best.pt --images some_folder/ --out-dir cams/
+python gradcam.py --ckpt runs/loopvit/best.pt --images leaf.jpg --target Apple___healthy --save-raw
+
+# predict, optionally with a different loop count
+python predict.py --ckpt runs/loopvit/best.pt --images some_folder/ --num-loops 2
+
+# tests (synthetic data, about 1 minute on CPU)
+python -m pytest tests -q
+```
+
+## Current results
+
+PlantVillage, 5 classes, default model (11.02M params), `best.pt` at **epoch 7 of 100**
+(the run was interrupted), val split of 467 images:
+
+| Accuracy | Macro F1 | MCC | Cohen's κ | ROC-AUC | PR-AUC | Brier | ECE |
+|---|---|---|---|---|---|---|---|
+| 0.929 [0.904, 0.951] | 0.934 | 0.904 | 0.903 | 0.992 | 0.979 | 0.115 | 0.082 |
+
+With 2 loop passes (as trained), accuracy is 92.9%. One pass gives 92.5%, 3 passes
+92.1%, and 4 passes 90.8%. Cost: 9.2 GFLOPs per image, 7 ms per image on an RTX 3060.
+The Grad-CAM maps for the healthy classes mostly highlight the background, and the val
+split also picked `best.pt`. Train fully with `--test-split` before reporting.
+Details, per-class numbers and open issues are in
+[`notes/training_evaluation.md`](notes/training_evaluation.md). The architecture is
+described in [`notes/architecture.md`](notes/architecture.md).
 
 ## Notes
 - The default is the plain Nanbeige recipe. `loop_embedding: true` adds a learned vector per pass, which is not in Nanbeige.
